@@ -17,5 +17,6 @@ blindfold = "blindfold.cli:cli"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-blindfold = ["../templates/*"]
+# Note: Template content is embedded as string constants in
+# blindfold/installer.py.  The templates/ directory at the project root
+# is kept for reference only and is not packaged.

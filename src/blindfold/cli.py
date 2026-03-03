@@ -12,6 +12,7 @@ from pathlib import Path
 import click
 
 from blindfold import env_file
+from blindfold.installer import init, install
 from blindfold.secret_input import get_secret_from_clipboard, get_secret_from_tty
 
 
@@ -252,3 +253,11 @@ def import_env(ctx: click.Context, file: str, no_overwrite: bool) -> None:
     click.echo(f"Imported {len(imported)} key(s) into {filename}")
     if skipped:
         click.echo(f"Skipped {len(skipped)} existing key(s): {', '.join(skipped)}")
+
+
+# ---------------------------------------------------------------------------
+# install / init (defined in installer.py, registered here)
+# ---------------------------------------------------------------------------
+
+cli.add_command(install)
+cli.add_command(init)
