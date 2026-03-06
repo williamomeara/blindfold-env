@@ -1,11 +1,10 @@
 """
 Install and init commands for blindfold-env.
 
-``blindfold install`` — global installation (writes to ~/.claude/)
-``blindfold init``    — per-project setup (writes to current directory)
+``blindfold install`` — global installation (registers MCP server, deny patterns)
+``blindfold init``    — per-project setup (deny patterns + .env creation)
 
-Both commands are idempotent: they detect the "blindfold-env" marker in
-CLAUDE.md files and avoid duplicating content.
+Both commands are idempotent.
 """
 
 from __future__ import annotations
@@ -17,25 +16,8 @@ from typing import Any, Dict, List
 import click
 
 # ---------------------------------------------------------------------------
-# Marker used to detect whether blindfold rules have already been injected.
+# Constants
 # ---------------------------------------------------------------------------
-_MARKER = "blindfold-env"
-
-# ---------------------------------------------------------------------------
-# Template content — stored as string constants to avoid path resolution
-# issues between editable installs, wheels, etc.
-# ---------------------------------------------------------------------------
-
-_CLAUDE_MD_RULES = """\
-
-## Secret Management — MANDATORY RULES (blindfold-env)
-- NEVER read .env files directly (cat, head, Read tool, grep on .env, etc.)
-- NEVER write to .env files directly (echo >>, Edit tool, Write tool, etc.)
-- ALL .env interactions MUST go through the `blindfold` CLI tool
-- When a user wants to set a secret: `blindfold set <KEY_NAME>`
-- To check what keys exist: `blindfold list`
-- To see a masked value: `blindfold get <KEY_NAME>`
-"""
 
 _DENY_PATTERNS: List[str] = [
     "Read(.env*)",
@@ -51,51 +33,15 @@ _DENY_PATTERNS: List[str] = [
     "Bash(awk * .env*)",
 ]
 
-_SKILL_CONTENT = """\
----
-name: blindfold
-description: Manage .env secrets without exposing values to AI assistants
----
-
-# blindfold — Secret Management
-
-Use the `blindfold` CLI to manage .env files. NEVER read or write .env files directly.
-
-## Commands
-- `blindfold set <KEY>` — Set a secret (prompts user via /dev/tty)
-- `blindfold set <KEY> --clipboard` — Set from clipboard
-- `blindfold get <KEY>` — Show masked value
-- `blindfold list` — List all key names
-- `blindfold delete <KEY>` — Remove a key
-- `blindfold rename <OLD> <NEW>` — Rename a key
-- `blindfold copy <KEY> <NEW_KEY>` — Duplicate a value
-- `blindfold import <FILE>` — Bulk import from another .env
-- `blindfold --env production <command>` — Target .env.production
-"""
+_MCP_SERVER_ENTRY: Dict[str, Any] = {
+    "command": "blindfold",
+    "args": ["mcp-server"],
+}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _append_rules_to_claude_md(path: Path) -> bool:
-    """Append blindfold rules to a CLAUDE.md file.
-
-    Creates the file if it does not exist.  Skips if the marker is already
-    present.  Returns True if the file was modified, False if skipped.
-    """
-    if path.exists():
-        existing = path.read_text(encoding="utf-8")
-        if _MARKER in existing:
-            return False
-    else:
-        existing = ""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(_CLAUDE_MD_RULES)
-    return True
-
 
 def _merge_deny_patterns(path: Path) -> bool:
     """Merge blindfold deny patterns into a settings.json file.
@@ -125,16 +71,29 @@ def _merge_deny_patterns(path: Path) -> bool:
     return True
 
 
-def _create_skill_file(path: Path) -> bool:
-    """Create the blindfold skill file.
+def _register_mcp_server(path: Path, entry: Dict[str, Any] | None = None) -> bool:
+    """Register blindfold MCP server in ~/.claude.json.
 
-    Returns True if the file was created, False if it already exists.
+    Merges the server entry under mcpServers.blindfold.
+    Returns True if the file was modified, False if already registered.
     """
+    if entry is None:
+        entry = _MCP_SERVER_ENTRY
+
+    data: Dict[str, Any] = {}
     if path.exists():
+        raw = path.read_text(encoding="utf-8")
+        if raw.strip():
+            data = json.loads(raw)
+
+    mcp_servers = data.setdefault("mcpServers", {})
+
+    if "blindfold" in mcp_servers:
         return False
 
+    mcp_servers["blindfold"] = entry
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_SKILL_CONTENT, encoding="utf-8")
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return True
 
 
@@ -143,37 +102,66 @@ def _create_skill_file(path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 @click.command("install")
-def install() -> None:
-    """Install blindfold rules globally (~/.claude/)."""
+@click.option("--remote", default=None, metavar="USER@HOST",
+              help="SSH remote host (e.g. user@myserver). Registers MCP server with port forwarding.")
+@click.option("--port", default=19876, show_default=True,
+              help="Local port for the browser form (used with --remote).")
+def install(remote: str | None, port: int) -> None:
+    """Install blindfold globally (~/.claude.json + ~/.claude/settings.json)."""
     home = Path.home()
-    claude_dir = home / ".claude"
     actions: List[str] = []
 
-    # 1. Append rules to ~/.claude/CLAUDE.md
-    claude_md = claude_dir / "CLAUDE.md"
-    if _append_rules_to_claude_md(claude_md):
-        actions.append(f"Appended rules to {claude_md}")
+    # 1. Register MCP server in ~/.claude.json
+    claude_json = home / ".claude.json"
+    if remote:
+        mcp_entry: Dict[str, Any] = {
+            "command": "ssh",
+            "args": [f"-L{port}:localhost:{port}", remote, "blindfold", "mcp-server"],
+        }
     else:
-        actions.append(f"Rules already present in {claude_md} (skipped)")
+        mcp_entry = _MCP_SERVER_ENTRY
+
+    if _register_mcp_server(claude_json, mcp_entry):
+        if remote:
+            actions.append(
+                f"MCP server registered in {claude_json} (SSH: localhost:{port} → {remote})"
+            )
+        else:
+            actions.append(f"MCP server registered in {claude_json}")
+    else:
+        actions.append(f"MCP server already registered in {claude_json} (skipped)")
 
     # 2. Merge deny patterns into ~/.claude/settings.json
-    settings = claude_dir / "settings.json"
+    settings = home / ".claude" / "settings.json"
     if _merge_deny_patterns(settings):
-        actions.append(f"Merged deny patterns into {settings}")
+        actions.append(f"Deny patterns merged into {settings}")
     else:
         actions.append(f"Deny patterns already present in {settings} (skipped)")
-
-    # 3. Create skill file
-    skill_path = claude_dir / "skills" / "blindfold" / "SKILL.md"
-    if _create_skill_file(skill_path):
-        actions.append(f"Created skill file at {skill_path}")
-    else:
-        actions.append(f"Skill file already exists at {skill_path} (skipped)")
 
     # Summary
     click.echo("blindfold install complete:")
     for action in actions:
         click.echo(f"  {action}")
+    click.echo()
+    click.echo("Restart Claude Code to activate tools.")
+    click.echo()
+
+    if remote:
+        click.echo(
+            f"When blindfold_set is called, open http://localhost:{port}/<token> in your browser."
+        )
+        click.echo(
+            "All traffic is encrypted through the SSH tunnel — the secret never touches the network."
+        )
+        click.echo()
+        click.echo("Tip: for a native GUI dialog instead of the browser form, run:")
+        click.echo("  blindfold agent  (on your local machine)")
+        click.echo("and reinstall with --agent flag.")
+    else:
+        click.echo("Tools: blindfold_list, blindfold_get, blindfold_set, blindfold_delete, blindfold_rename")
+        click.echo()
+        click.echo("For Cursor: add to .cursor/mcp.json:")
+        click.echo('  {"mcpServers":{"blindfold":{"command":"blindfold","args":["mcp-server"]}}}')
 
 
 @click.command("init")
@@ -184,21 +172,14 @@ def init(ctx: click.Context) -> None:
     env_name = ctx.obj.get("env_name") if ctx.obj else None
     actions: List[str] = []
 
-    # 1. Append rules to project CLAUDE.md
-    claude_md = project_dir / "CLAUDE.md"
-    if _append_rules_to_claude_md(claude_md):
-        actions.append(f"Appended rules to {claude_md}")
-    else:
-        actions.append(f"Rules already present in {claude_md} (skipped)")
-
-    # 2. Merge deny patterns into .claude/settings.json
+    # 1. Merge deny patterns into .claude/settings.json
     settings = project_dir / ".claude" / "settings.json"
     if _merge_deny_patterns(settings):
         actions.append(f"Merged deny patterns into {settings}")
     else:
         actions.append(f"Deny patterns already present in {settings} (skipped)")
 
-    # 3. Create .env file(s) if they don't exist
+    # 2. Create .env file(s) if they don't exist
     if env_name:
         env_path = project_dir / f".env.{env_name}"
     else:

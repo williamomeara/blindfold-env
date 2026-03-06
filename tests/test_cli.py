@@ -44,11 +44,19 @@ class TestMaskValue:
 # -----------------------------------------------------------------------
 
 class TestCliSet:
+    def test_gui_path_default(self):
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            with patch("blindfold.cli.get_secret_from_gui", return_value="mysecret"):
+                result = runner.invoke(cli, ["set", "MY_KEY"])
+        assert result.exit_code == 0
+        assert "Set MY_KEY" in result.output
+
     def test_tty_path(self):
         runner = CliRunner()
         with runner.isolated_filesystem():
             with patch("blindfold.cli.get_secret_from_tty", return_value="mysecret"):
-                result = runner.invoke(cli, ["set", "MY_KEY"])
+                result = runner.invoke(cli, ["set", "MY_KEY", "--tty"])
         assert result.exit_code == 0
         assert "Set MY_KEY" in result.output
 
@@ -60,10 +68,17 @@ class TestCliSet:
         assert result.exit_code == 0
         assert "Set CLIP_KEY" in result.output
 
+    def test_clipboard_and_tty_mutually_exclusive(self):
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            result = runner.invoke(cli, ["set", "MY_KEY", "--clipboard", "--tty"])
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.output
+
     def test_set_writes_to_env_file(self):
         runner = CliRunner()
         with runner.isolated_filesystem() as td:
-            with patch("blindfold.cli.get_secret_from_tty", return_value="val123"):
+            with patch("blindfold.cli.get_secret_from_gui", return_value="val123"):
                 runner.invoke(cli, ["set", "DB_HOST"])
             env_path = Path(td) / ".env"
             assert env_path.exists()
@@ -77,7 +92,7 @@ class TestCliSet:
     def test_env_flag_routes_to_named_file(self):
         runner = CliRunner()
         with runner.isolated_filesystem() as td:
-            with patch("blindfold.cli.get_secret_from_tty", return_value="prodval"):
+            with patch("blindfold.cli.get_secret_from_gui", return_value="prodval"):
                 result = runner.invoke(cli, ["--env", "production", "set", "API_KEY"])
         assert result.exit_code == 0
         assert ".env.production" in result.output

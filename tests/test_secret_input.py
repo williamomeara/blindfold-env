@@ -11,9 +11,118 @@ import pytest
 from blindfold.secret_input import (
     get_secret_from_tty,
     get_secret_from_clipboard,
+    get_secret_from_gui,
     _is_wsl,
     _run_clipboard_cmd,
 )
+
+
+# -----------------------------------------------------------------------
+# get_secret_from_gui
+# -----------------------------------------------------------------------
+
+class TestGetSecretFromGUI:
+    # tkinter is tried first; patch it to succeed or fail as needed.
+
+    def test_tkinter_used_by_default(self):
+        with patch("blindfold.secret_input._gui_tkinter", return_value="guival") as mock_tk:
+            result = get_secret_from_gui("API_KEY", "my-project")
+        assert result == "guival"
+        mock_tk.assert_called_once_with("API_KEY", "my-project")
+
+    def test_tkinter_cancel_raises_abort(self):
+        with patch("blindfold.secret_input._gui_tkinter", side_effect=click.Abort()):
+            with pytest.raises(click.Abort):
+                get_secret_from_gui("API_KEY", "my-project")
+
+    # When tkinter is unavailable, fall back to osascript (macOS) or zenity (Linux).
+
+    @patch("blindfold.secret_input._gui_tkinter", side_effect=RuntimeError("no tkinter"))
+    @patch("blindfold.secret_input.sys")
+    @patch("blindfold.secret_input.subprocess.run")
+    def test_macos_osascript_fallback(self, mock_run, mock_sys, mock_tk):
+        mock_sys.platform = "darwin"
+        mock_run.return_value = MagicMock(returncode=0, stdout="mysecret\n", stderr="")
+        result = get_secret_from_gui("API_KEY", "my-project")
+        assert result == "mysecret"
+        args = mock_run.call_args[0][0]
+        assert args[0] == "osascript"
+        assert "API_KEY" in args[2]
+        assert "my-project" in args[2]
+        assert "Secret value for" in args[2]
+        assert "Save" in args[2]
+
+    @patch("blindfold.secret_input._gui_tkinter", side_effect=RuntimeError("no tkinter"))
+    @patch("blindfold.secret_input.sys")
+    @patch("blindfold.secret_input.subprocess.run")
+    def test_macos_osascript_cancel_raises_abort(self, mock_run, mock_sys, mock_tk):
+        mock_sys.platform = "darwin"
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="User cancelled.")
+        with pytest.raises(click.Abort):
+            get_secret_from_gui("API_KEY", "my-project")
+
+    @patch("blindfold.secret_input._gui_tkinter", side_effect=RuntimeError("no tkinter"))
+    @patch("blindfold.secret_input.sys")
+    @patch("blindfold.secret_input.subprocess.run")
+    def test_macos_osascript_empty_value_allowed(self, mock_run, mock_sys, mock_tk):
+        mock_sys.platform = "darwin"
+        mock_run.return_value = MagicMock(returncode=0, stdout="\n", stderr="")
+        result = get_secret_from_gui("API_KEY", "my-project")
+        assert result == ""
+
+    @patch("blindfold.secret_input._gui_tkinter", side_effect=RuntimeError("no tkinter"))
+    @patch("blindfold.secret_input.shutil.which", return_value="/usr/bin/zenity")
+    @patch("blindfold.secret_input.sys")
+    @patch("blindfold.secret_input.subprocess.run")
+    def test_linux_zenity_fallback(self, mock_run, mock_sys, mock_which, mock_tk):
+        mock_sys.platform = "linux"
+        mock_run.return_value = MagicMock(returncode=0, stdout="zenitsecret\n", stderr="")
+        result = get_secret_from_gui("DB_URL", "proj")
+        assert result == "zenitsecret"
+        args = mock_run.call_args[0][0]
+        assert args[0] == "zenity"
+        assert "--entry" in args
+        assert "--hide-text" in args
+        assert any("Set Secret" in a for a in args)
+        assert any("Secret value for" in a for a in args)
+
+    @patch("blindfold.secret_input._gui_tkinter", side_effect=RuntimeError("no tkinter"))
+    @patch("blindfold.secret_input.shutil.which", return_value="/usr/bin/zenity")
+    @patch("blindfold.secret_input.sys")
+    @patch("blindfold.secret_input.subprocess.run")
+    def test_linux_zenity_cancel_raises_abort(self, mock_run, mock_sys, mock_which, mock_tk):
+        mock_sys.platform = "linux"
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+        with pytest.raises(click.Abort):
+            get_secret_from_gui("DB_URL", "proj")
+
+    @patch("blindfold.secret_input._gui_tkinter", side_effect=RuntimeError("no tkinter"))
+    @patch("blindfold.secret_input.shutil.which", return_value=None)
+    @patch("blindfold.secret_input.sys")
+    def test_no_gui_available_raises_runtime_error(self, mock_sys, mock_which, mock_tk):
+        mock_sys.platform = "linux"
+        with pytest.raises(RuntimeError, match="No GUI dialog available"):
+            get_secret_from_gui("KEY", "proj")
+
+    @patch("blindfold.secret_input._gui_tkinter", side_effect=RuntimeError("no tkinter"))
+    @patch("blindfold.secret_input.sys")
+    @patch(
+        "blindfold.secret_input.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd="osascript", timeout=120),
+    )
+    def test_macos_osascript_timeout_raises_abort(self, mock_run, mock_sys, mock_tk):
+        mock_sys.platform = "darwin"
+        with pytest.raises(click.Abort):
+            get_secret_from_gui("KEY", "proj")
+
+    @patch("blindfold.secret_input._gui_tkinter", side_effect=RuntimeError("no tkinter"))
+    @patch("blindfold.secret_input.sys")
+    @patch("blindfold.secret_input.subprocess.run")
+    def test_macos_osascript_timeout_sentinel_raises_abort(self, mock_run, mock_sys, mock_tk):
+        mock_sys.platform = "darwin"
+        mock_run.return_value = MagicMock(returncode=0, stdout="__TIMEOUT__\n", stderr="")
+        with pytest.raises(click.Abort):
+            get_secret_from_gui("KEY", "proj")
 
 
 # -----------------------------------------------------------------------

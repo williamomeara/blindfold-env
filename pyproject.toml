@@ -9,6 +9,7 @@ description = "A CLI tool that manages .env files on behalf of AI assistants wit
 requires-python = ">=3.9"
 dependencies = [
     "click>=8.0",
+    "fastmcp>=2.0",
 ]
 
 [project.scripts]
@@ -16,6 +17,9 @@ blindfold = "blindfold.cli:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+blindfold = ["assets/icon.icns", "assets/icon.png"]
 
 # Note: Template content is embedded as string constants in
 # blindfold/installer.py.  The templates/ directory at the project root

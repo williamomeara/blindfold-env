@@ -13,7 +13,11 @@ import click
 
 from blindfold import env_file
 from blindfold.installer import init, install
-from blindfold.secret_input import get_secret_from_clipboard, get_secret_from_tty
+from blindfold.secret_input import (
+    get_secret_from_clipboard,
+    get_secret_from_gui,
+    get_secret_from_tty,
+)
 
 
 def _validate_key_name(key: str) -> None:
@@ -75,15 +79,21 @@ def cli(ctx: click.Context, env_name: str | None) -> None:
 @cli.command("set")
 @click.argument("key")
 @click.option("--clipboard", is_flag=True, help="Read the secret from the system clipboard.")
+@click.option("--tty", is_flag=True, help="Read the secret interactively from the terminal (TTY).")
 @click.pass_context
-def set_key(ctx: click.Context, key: str, clipboard: bool) -> None:
+def set_key(ctx: click.Context, key: str, clipboard: bool, tty: bool) -> None:
     """Set a secret value for KEY."""
     _validate_key_name(key)
 
+    if clipboard and tty:
+        raise click.UsageError("--clipboard and --tty are mutually exclusive.")
+
     if clipboard:
         value = get_secret_from_clipboard()
+    elif tty:
+        value = get_secret_from_tty(f"Secret value for {key}: ")
     else:
-        value = get_secret_from_tty(f"Enter value for {key}: ")
+        value = get_secret_from_gui(key, Path.cwd().name)
 
     path = _resolve(ctx)
     env_file.set_value(path, key, value)
@@ -253,6 +263,17 @@ def import_env(ctx: click.Context, file: str, no_overwrite: bool) -> None:
     click.echo(f"Imported {len(imported)} key(s) into {filename}")
     if skipped:
         click.echo(f"Skipped {len(skipped)} existing key(s): {', '.join(skipped)}")
+
+
+# ---------------------------------------------------------------------------
+# mcp-server
+# ---------------------------------------------------------------------------
+
+@cli.command("mcp-server")
+def mcp_server_cmd() -> None:
+    """Start the blindfold MCP server (stdio transport)."""
+    from blindfold.mcp_server import main
+    main()
 
 
 # ---------------------------------------------------------------------------
