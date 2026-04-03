@@ -4,16 +4,25 @@ Secret input methods for blindfold-env.
 Provides two ways to obtain a secret value without exposing it to stdout
 (and therefore to any AI assistant driving the CLI via stdio):
 
-- TTY input:   Opens /dev/tty directly via ``getpass.getpass()`` so the
-               user can type or paste a secret interactively.
+- GUI dialog:  When stdin is not a terminal (e.g. blindfold is driven by an
+               AI assistant), spawns a platform-appropriate GUI dialog
+               (pinentry, zenity, kdialog, or osascript) so the user can
+               type the secret without it appearing in any terminal output.
+
+               Requires a graphical session (DISPLAY/WAYLAND_DISPLAY on
+               Linux, or native macOS GUI).  Falls back to a --clipboard
+               hint for headless/SSH environments without a display.
+
 - Clipboard:   Reads the system clipboard via a platform-appropriate
                command-line tool, so the secret never appears on any
-               terminal at all.
+               terminal at all.  This is the recommended path when
+               blindfold is driven by an AI assistant without a display.
 """
 
 from __future__ import annotations
 
 import getpass
+import os
 import shutil
 import subprocess
 import sys
@@ -22,11 +31,19 @@ import click
 
 
 # ---------------------------------------------------------------------------
-# TTY input
+# TTY / GUI dialog input
 # ---------------------------------------------------------------------------
 
 def get_secret_from_tty(prompt: str) -> str:
-    """Read a secret interactively from ``/dev/tty`` via :func:`getpass.getpass`.
+    """Read a secret interactively from a terminal or GUI dialog.
+
+    When stdin is a real TTY (normal interactive use), delegates to
+    :func:`getpass.getpass` which reads from ``/dev/tty`` directly.
+
+    When stdin is not a TTY (e.g. blindfold is driven by an AI assistant),
+    spawns a GUI password dialog — trying ``pinentry``, ``zenity``,
+    ``kdialog``, and ``osascript`` in order — so the user can enter the
+    secret without it appearing in any terminal output.
 
     Parameters
     ----------
@@ -41,17 +58,207 @@ def get_secret_from_tty(prompt: str) -> str:
     Raises
     ------
     click.ClickException
-        If ``/dev/tty`` is not available (e.g. when running inside a
-        non-interactive pipe or an AI assistant session without a TTY).
+        If no terminal or GUI dialog is available.
+    click.Abort
+        If the user cancels the GUI dialog.
     """
+    if sys.stdin.isatty():
+        try:
+            return getpass.getpass(prompt=prompt)
+        except OSError as exc:
+            raise click.ClickException(
+                f"Cannot open /dev/tty for secret input: {exc}\n"
+                "Hint: use  blindfold set KEY --clipboard  to read the secret "
+                "from your system clipboard instead."
+            ) from exc
+
+    # No terminal — try a GUI popup dialog.
+    secret = _get_secret_from_gui(prompt)
+    if secret is not None:
+        return secret
+
+    raise click.ClickException(
+        "No usable terminal or GUI dialog found for secret input.\n"
+        "Hint: copy the secret to your clipboard, then run:\n"
+        "  blindfold set KEY --clipboard"
+    )
+
+
+def _get_secret_from_gui(prompt: str) -> str | None:
+    """Try each available GUI dialog tool; return the secret or ``None``.
+
+    On macOS tries ``osascript`` only.
+    On Linux/other tries ``pinentry``, ``zenity``, ``kdialog`` in order.
+    Returns ``None`` if no tool is available or can open a display.
+    Raises :class:`click.Abort` if the user explicitly cancels a dialog.
+    """
+    if sys.platform == "darwin":
+        return _try_osascript(prompt)
+
+    for try_fn in (_try_pinentry, _try_zenity, _try_kdialog):
+        result = try_fn(prompt)
+        if result is not None:
+            return result
+
+    return None
+
+
+def _has_display() -> bool:
+    """Return ``True`` if a graphical display environment variable is set."""
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _try_pinentry(prompt: str) -> str | None:
+    """Invoke ``pinentry`` via the Assuan protocol; return secret or ``None``.
+
+    Returns ``None`` if pinentry is not installed, no display is available,
+    or pinentry fails to start.  Raises :class:`click.Abort` if the user
+    explicitly cancels (pinentry returns ``ERR`` during ``GETPIN``).
+    """
+    if not _has_display() or not shutil.which("pinentry"):
+        return None
+
+    desc = prompt.rstrip(": ")
     try:
-        return getpass.getpass(prompt=prompt)
-    except OSError as exc:
-        raise click.ClickException(
-            f"Cannot open /dev/tty for secret input: {exc}\n"
-            "Hint: use  blindfold set KEY --clipboard  to read the secret "
-            "from your system clipboard instead."
-        ) from exc
+        proc = subprocess.Popen(
+            ["pinentry"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+    except OSError:
+        return None
+
+    try:
+        proc.stdout.readline()  # greeting: "OK Pleased to meet you"
+
+        proc.stdin.write(f"SETPROMPT {desc}\n")
+        proc.stdin.flush()
+        resp = proc.stdout.readline().rstrip("\n")
+        if not resp.startswith("OK"):
+            return None  # pinentry could not open display or other error
+
+        proc.stdin.write("GETPIN\n")
+        proc.stdin.flush()
+
+        secret = None
+        while True:
+            line = proc.stdout.readline().rstrip("\n")
+            if not line:
+                break
+            if line.startswith("D "):
+                secret = line[2:]
+            elif line.startswith("OK"):
+                break
+            elif line.startswith("ERR"):
+                raise click.Abort()
+
+        return secret if secret is not None else ""
+    finally:
+        try:
+            proc.stdin.write("BYE\n")
+            proc.stdin.flush()
+        except OSError:
+            pass
+        proc.wait()
+
+
+def _try_zenity(prompt: str) -> str | None:
+    """Invoke ``zenity --entry --hide-text``; return secret or ``None``.
+
+    Returns ``None`` if zenity is not installed or no display is available.
+    Raises :class:`click.Abort` if the user cancels the dialog.
+    """
+    if not _has_display() or not shutil.which("zenity"):
+        return None
+
+    try:
+        result = subprocess.run(
+            ["zenity", "--entry", "--hide-text",
+             "--title=blindfold", f"--text={prompt}"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        raise click.Abort()
+
+    content = result.stdout
+    if content.endswith("\n"):
+        content = content[:-1]
+    return content
+
+
+def _try_kdialog(prompt: str) -> str | None:
+    """Invoke ``kdialog --password``; return secret or ``None``.
+
+    Returns ``None`` if kdialog is not installed or no display is available.
+    Raises :class:`click.Abort` if the user cancels the dialog.
+    """
+    if not _has_display() or not shutil.which("kdialog"):
+        return None
+
+    try:
+        result = subprocess.run(
+            ["kdialog", "--title", "blindfold", "--password", prompt],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        raise click.Abort()
+
+    content = result.stdout
+    if content.endswith("\n"):
+        content = content[:-1]
+    return content
+
+
+def _try_osascript(prompt: str) -> str | None:
+    """Invoke an AppleScript password dialog; return secret or ``None``.
+
+    Returns ``None`` if ``osascript`` is not available.
+    Raises :class:`click.Abort` if the user cancels the dialog.
+    """
+    if not shutil.which("osascript"):
+        return None
+
+    script = (
+        f'display dialog {prompt!r} '
+        'with hidden answer default answer "" '
+        'buttons {"Cancel", "OK"} default button "OK"'
+    )
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        raise click.Abort()
+
+    # stdout: "button returned:OK, text returned:<secret>"
+    # Use find() to handle secrets that contain commas.
+    marker = "text returned:"
+    idx = result.stdout.find(marker)
+    if idx != -1:
+        content = result.stdout[idx + len(marker):]
+        if content.endswith("\n"):
+            content = content[:-1]
+        return content
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
