@@ -11,59 +11,11 @@ from click.testing import CliRunner
 
 from blindfold.cli import cli
 from blindfold.installer import (
-    _append_rules_to_claude_md,
     _merge_deny_patterns,
-    _create_skill_file,
-    _MARKER,
+    _register_mcp_server,
     _DENY_PATTERNS,
+    _MCP_SERVER_ENTRY,
 )
-
-
-# -----------------------------------------------------------------------
-# _append_rules_to_claude_md
-# -----------------------------------------------------------------------
-
-class TestAppendRulesToClaudeMd:
-    def test_creates_file_when_missing(self, tmp_path):
-        path = tmp_path / "CLAUDE.md"
-        result = _append_rules_to_claude_md(path)
-        assert result is True
-        assert path.exists()
-        assert _MARKER in path.read_text()
-
-    def test_appends_to_existing(self, tmp_path):
-        path = tmp_path / "CLAUDE.md"
-        path.write_text("# Existing content\n")
-        result = _append_rules_to_claude_md(path)
-        assert result is True
-        content = path.read_text()
-        assert "# Existing content" in content
-        assert _MARKER in content
-
-    def test_skips_if_marker_present(self, tmp_path):
-        path = tmp_path / "CLAUDE.md"
-        path.write_text(f"# Existing\n## {_MARKER}\n")
-        result = _append_rules_to_claude_md(path)
-        assert result is False
-
-    def test_skips_does_not_modify_file(self, tmp_path):
-        path = tmp_path / "CLAUDE.md"
-        original = f"# Existing\n## {_MARKER}\nsome rules\n"
-        path.write_text(original)
-        _append_rules_to_claude_md(path)
-        assert path.read_text() == original
-
-    def test_creates_parent_dirs(self, tmp_path):
-        path = tmp_path / "subdir" / "nested" / "CLAUDE.md"
-        _append_rules_to_claude_md(path)
-        assert path.exists()
-
-    def test_no_duplicate_on_second_call(self, tmp_path):
-        path = tmp_path / "CLAUDE.md"
-        _append_rules_to_claude_md(path)
-        _append_rules_to_claude_md(path)
-        content = path.read_text()
-        assert content.count(_MARKER) == 1
 
 
 # -----------------------------------------------------------------------
@@ -110,7 +62,6 @@ class TestMergeDenyPatterns:
 
     def test_partial_presence_adds_missing(self, tmp_path):
         path = tmp_path / "settings.json"
-        # Add only first pattern
         existing = {"permissions": {"deny": [_DENY_PATTERNS[0]]}}
         path.write_text(json.dumps(existing))
         result = _merge_deny_patterns(path)
@@ -135,31 +86,63 @@ class TestMergeDenyPatterns:
 
 
 # -----------------------------------------------------------------------
-# _create_skill_file
+# _register_mcp_server
 # -----------------------------------------------------------------------
 
-class TestCreateSkillFile:
-    def test_creates_file_and_dirs(self, tmp_path):
-        path = tmp_path / "skills" / "blindfold" / "SKILL.md"
-        result = _create_skill_file(path)
+class TestRegisterMcpServer:
+    def test_creates_file_when_missing(self, tmp_path):
+        path = tmp_path / ".claude.json"
+        result = _register_mcp_server(path)
         assert result is True
         assert path.exists()
-        assert "blindfold" in path.read_text().lower()
+        data = json.loads(path.read_text())
+        assert data["mcpServers"]["blindfold"] == _MCP_SERVER_ENTRY
 
-    def test_skips_if_exists(self, tmp_path):
-        path = tmp_path / "SKILL.md"
-        path.write_text("existing content")
-        result = _create_skill_file(path)
+    def test_merges_into_existing_preserves_other_servers(self, tmp_path):
+        path = tmp_path / ".claude.json"
+        existing = {"mcpServers": {"other-server": {"command": "other"}}}
+        path.write_text(json.dumps(existing))
+        result = _register_mcp_server(path)
+        assert result is True
+        data = json.loads(path.read_text())
+        assert "other-server" in data["mcpServers"]
+        assert data["mcpServers"]["blindfold"] == _MCP_SERVER_ENTRY
+
+    def test_skips_if_already_registered(self, tmp_path):
+        path = tmp_path / ".claude.json"
+        existing = {"mcpServers": {"blindfold": _MCP_SERVER_ENTRY}}
+        path.write_text(json.dumps(existing))
+        result = _register_mcp_server(path)
         assert result is False
-        assert path.read_text() == "existing content"
 
-    def test_skill_content_has_commands(self, tmp_path):
-        path = tmp_path / "SKILL.md"
-        _create_skill_file(path)
-        content = path.read_text()
-        assert "blindfold set" in content
-        assert "blindfold get" in content
-        assert "blindfold list" in content
+    def test_idempotent_no_duplicate(self, tmp_path):
+        path = tmp_path / ".claude.json"
+        _register_mcp_server(path)
+        _register_mcp_server(path)
+        data = json.loads(path.read_text())
+        # Only one blindfold entry
+        assert list(data["mcpServers"].keys()).count("blindfold") == 1
+
+    def test_creates_parent_dirs(self, tmp_path):
+        path = tmp_path / "subdir" / ".claude.json"
+        _register_mcp_server(path)
+        assert path.exists()
+
+    def test_empty_existing_file(self, tmp_path):
+        path = tmp_path / ".claude.json"
+        path.write_text("")
+        result = _register_mcp_server(path)
+        assert result is True
+        data = json.loads(path.read_text())
+        assert "mcpServers" in data
+
+    def test_server_entry_has_correct_command(self, tmp_path):
+        path = tmp_path / ".claude.json"
+        _register_mcp_server(path)
+        data = json.loads(path.read_text())
+        entry = data["mcpServers"]["blindfold"]
+        assert entry["command"] == "blindfold"
+        assert entry["args"] == ["mcp-server"]
 
 
 # -----------------------------------------------------------------------
@@ -173,19 +156,83 @@ class TestRunInstall:
             result = runner.invoke(cli, ["install"])
         assert result.exit_code == 0
         assert "blindfold install complete" in result.output
-        assert (tmp_path / ".claude" / "CLAUDE.md").exists()
+        assert (tmp_path / ".claude.json").exists()
         assert (tmp_path / ".claude" / "settings.json").exists()
-        assert (tmp_path / ".claude" / "skills" / "blindfold" / "SKILL.md").exists()
 
-    def test_install_output_lists_actions(self, tmp_path):
+    def test_install_registers_mcp_server(self, tmp_path):
+        runner = CliRunner()
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            runner.invoke(cli, ["install"])
+        data = json.loads((tmp_path / ".claude.json").read_text())
+        assert data["mcpServers"]["blindfold"]["command"] == "blindfold"
+        assert data["mcpServers"]["blindfold"]["args"] == ["mcp-server"]
+
+    def test_install_adds_deny_patterns(self, tmp_path):
+        runner = CliRunner()
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            runner.invoke(cli, ["install"])
+        data = json.loads((tmp_path / ".claude" / "settings.json").read_text())
+        deny = data["permissions"]["deny"]
+        for pattern in _DENY_PATTERNS:
+            assert pattern in deny
+
+    def test_install_output_mentions_tools(self, tmp_path):
+        runner = CliRunner()
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = runner.invoke(cli, ["install"])
+        assert "blindfold_list" in result.output
+        assert "blindfold_set" in result.output
+
+    def test_install_remote_registers_ssh_entry(self, tmp_path):
+        runner = CliRunner()
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = runner.invoke(cli, ["install", "--remote", "user@myhost"])
+        assert result.exit_code == 0
+        data = json.loads((tmp_path / ".claude.json").read_text())
+        entry = data["mcpServers"]["blindfold"]
+        assert entry["command"] == "ssh"
+        assert "user@myhost" in entry["args"]
+        assert "blindfold" in entry["args"]
+        assert "mcp-server" in entry["args"]
+
+    def test_install_remote_default_port_in_args(self, tmp_path):
+        runner = CliRunner()
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            runner.invoke(cli, ["install", "--remote", "user@myhost"])
+        data = json.loads((tmp_path / ".claude.json").read_text())
+        args = data["mcpServers"]["blindfold"]["args"]
+        assert any("19876" in a for a in args)
+
+    def test_install_remote_custom_port(self, tmp_path):
+        runner = CliRunner()
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            runner.invoke(cli, ["install", "--remote", "user@myhost", "--port", "9000"])
+        data = json.loads((tmp_path / ".claude.json").read_text())
+        args = data["mcpServers"]["blindfold"]["args"]
+        assert any("9000" in a for a in args)
+
+    def test_install_remote_output_mentions_ssh(self, tmp_path):
+        runner = CliRunner()
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = runner.invoke(cli, ["install", "--remote", "user@myhost"])
+        assert "SSH" in result.output or "ssh" in result.output.lower()
+        assert "user@myhost" in result.output
+
+    def test_install_remote_output_mentions_tunnel(self, tmp_path):
+        runner = CliRunner()
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = runner.invoke(cli, ["install", "--remote", "user@myhost"])
+        assert "tunnel" in result.output.lower() or "localhost:" in result.output
+
+    def test_install_no_remote_still_works(self, tmp_path):
         runner = CliRunner()
         with patch("pathlib.Path.home", return_value=tmp_path):
             result = runner.invoke(cli, ["install"])
         assert result.exit_code == 0
-        # Should mention three actions
-        lines = [l for l in result.output.splitlines() if l.strip().startswith("Appended") or
-                 l.strip().startswith("Merged") or l.strip().startswith("Created")]
-        assert len(lines) == 3
+        data = json.loads((tmp_path / ".claude.json").read_text())
+        entry = data["mcpServers"]["blindfold"]
+        assert entry["command"] == "blindfold"
+        assert entry["args"] == ["mcp-server"]
 
     def test_idempotent(self, tmp_path):
         runner = CliRunner()
@@ -194,26 +241,15 @@ class TestRunInstall:
             result = runner.invoke(cli, ["install"])
         assert result.exit_code == 0
         assert "skipped" in result.output
-        # CLAUDE.md should not have duplicate markers
-        claude_md = (tmp_path / ".claude" / "CLAUDE.md").read_text()
-        assert claude_md.count(_MARKER) == 1
 
     def test_idempotent_settings_no_duplicates(self, tmp_path):
         runner = CliRunner()
         with patch("pathlib.Path.home", return_value=tmp_path):
             runner.invoke(cli, ["install"])
             runner.invoke(cli, ["install"])
-        settings = (tmp_path / ".claude" / "settings.json").read_text()
-        data = json.loads(settings)
+        data = json.loads((tmp_path / ".claude" / "settings.json").read_text())
         deny = data["permissions"]["deny"]
         assert len(deny) == len(set(deny))
-
-    def test_install_adds_rules_to_claude_md(self, tmp_path):
-        runner = CliRunner()
-        with patch("pathlib.Path.home", return_value=tmp_path):
-            runner.invoke(cli, ["install"])
-        content = (tmp_path / ".claude" / "CLAUDE.md").read_text()
-        assert "NEVER read .env files" in content
 
 
 # -----------------------------------------------------------------------
@@ -227,7 +263,6 @@ class TestRunInit:
             result = runner.invoke(cli, ["init"])
             assert result.exit_code == 0
             assert "blindfold init complete" in result.output
-            assert (Path(td) / "CLAUDE.md").exists()
             assert (Path(td) / ".claude" / "settings.json").exists()
             assert (Path(td) / ".env").exists()
 
@@ -246,27 +281,22 @@ class TestRunInit:
             result = runner.invoke(cli, ["init"])
             assert result.exit_code == 0
             assert "skipped" in result.output
-            # Existing file should not be overwritten
             assert Path(".env").read_text() == "EXISTING=val\n"
 
     def test_idempotent(self):
         runner = CliRunner()
-        with runner.isolated_filesystem() as td:
+        with runner.isolated_filesystem():
             runner.invoke(cli, ["init"])
             result = runner.invoke(cli, ["init"])
             assert result.exit_code == 0
             assert "skipped" in result.output
-            # No duplicate markers in CLAUDE.md
-            claude_md = (Path(td) / "CLAUDE.md").read_text()
-            assert claude_md.count(_MARKER) == 1
 
     def test_idempotent_settings_no_duplicates(self):
         runner = CliRunner()
         with runner.isolated_filesystem() as td:
             runner.invoke(cli, ["init"])
             runner.invoke(cli, ["init"])
-            settings = (Path(td) / ".claude" / "settings.json").read_text()
-            data = json.loads(settings)
+            data = json.loads((Path(td) / ".claude" / "settings.json").read_text())
             deny = data["permissions"]["deny"]
             assert len(deny) == len(set(deny))
 
@@ -274,17 +304,13 @@ class TestRunInit:
         runner = CliRunner()
         with runner.isolated_filesystem() as td:
             runner.invoke(cli, ["init"])
-            settings = (Path(td) / ".claude" / "settings.json").read_text()
-            data = json.loads(settings)
+            data = json.loads((Path(td) / ".claude" / "settings.json").read_text())
             deny = data["permissions"]["deny"]
             for pattern in _DENY_PATTERNS:
                 assert pattern in deny
 
-    def test_init_appends_to_existing_claude_md(self):
+    def test_init_does_not_write_claude_md(self):
         runner = CliRunner()
         with runner.isolated_filesystem() as td:
-            Path("CLAUDE.md").write_text("# My Project\n\nExisting content.\n")
             runner.invoke(cli, ["init"])
-            content = (Path(td) / "CLAUDE.md").read_text()
-            assert "# My Project" in content
-            assert _MARKER in content
+            assert not (Path(td) / "CLAUDE.md").exists()
